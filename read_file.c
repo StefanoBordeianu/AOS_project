@@ -11,7 +11,7 @@
 #include <string.h>
 #include <linux/io_uring.h>
 
-#define QUEUE_DEPTH 1
+#define QUEUE_DEPTH 64
 #define BLOCK_DIM    1024
 
 #define barrier() __asm__ __volatile__("mfence":::"memory")
@@ -59,9 +59,11 @@ int io_uring_enter(int ring_fd, unsigned int to_submit,
 
 void print_to_user(char *buf, int len){
     while (len > 0) {
-        fputc(*buf++, stdout);
+        printf("%c",*buf);
+        buf++;
         len--;
     }
+    printf("\n");
 }
 
 
@@ -130,18 +132,20 @@ int init_io_uring(struct application_data* s){
     return 0;
 }
 
-int submit_read_req(char* filename, struct application_data* s){
+int submit_read_req(char* filename, struct application_data* ctx){
     struct request_info* req_info;
     int blocks;
+    struct sq_ring* sqring = &ctx->sq_ring;
+    struct io_uring_sqe *sqe;
+    unsigned index = 0;
+    unsigned current_block = 0;
+    unsigned tail = 0;
 
     int file_fd = open(filename, O_RDONLY);
     if (file_fd < 0 ) {
         perror("open");
         return 1;
     }
-
-    struct sq_ring* sqring = &s->sq_ring;
-    unsigned index = 0, current_block = 0, tail = 0, next_tail = 0;
 
     off_t size = file_size(file_fd);
     if (size < 0)
@@ -152,7 +156,7 @@ int submit_read_req(char* filename, struct application_data* s){
 
     req_info = malloc(sizeof(*req_info) + sizeof(struct iovec) * blocks);
     if(!req_info) {
-        fprintf(stderr, "Unable to allocate memory\n");
+        printf("Malloc failed\n");
         return 1;
     }
     req_info->file_size = size;
@@ -177,11 +181,9 @@ int submit_read_req(char* filename, struct application_data* s){
     }
 
     //add the SQE at the tail of the ring buffer
-    next_tail = tail = *sqring->tail;
-    next_tail++;
-    barrier();
-    index = tail & *s->sq_ring.ring_mask;
-    struct io_uring_sqe *sqe = &s->sqes[index];
+    tail = *sqring->tail;
+    index = tail & *ctx->sq_ring.ring_mask;
+    sqe = &ctx->sqes[index];
     sqe->fd = file_fd;
     sqe->opcode = IORING_OP_READV;
     sqe->addr = (unsigned long) req_info->iovecs;
@@ -190,24 +192,16 @@ int submit_read_req(char* filename, struct application_data* s){
     sqe->off = 0;
     sqe->user_data = (unsigned long long) req_info;
     sqring->array[index] = index;
-    tail = next_tail;
+    tail++;
+    barrier();
 
     //update the tail
     if(*sqring->tail != tail){
         *sqring->tail = tail;
         barrier();
     }
-
-    //submit the request and wait for 1 completion
-    int ret =  io_uring_enter(s->ring_fd, 1, 1, IORING_ENTER_GETEVENTS);
-    if(ret < 0){
-        perror("io_uring_enter");
-        return 1;
-    }
-
     return 0;
 }
-
 
 void read_from_cq(struct application_data *s){
     struct request_info* file_inf;
@@ -247,24 +241,33 @@ void read_from_cq(struct application_data *s){
 
 
 int main(int argc, char *argv[]){
-    struct application_data s;
-    memset(&s, 0, sizeof(struct application_data));
+    struct application_data ctx;
+    memset(&ctx, 0, sizeof(struct application_data));
 
     if(argc < 2) {
         printf("Need the filename as parameter\n");
         return 1;
     }
 
-    if(init_io_uring(&s)) {
+    if(init_io_uring(&ctx) < 0) {
         printf("Error during setup\n");
         return 1;
     }
 
-    if(submit_read_req(argv[1], &s)) {
-        printf("Error reading file\n");
+    for(int i=1; i<argc; i++){
+        if(submit_read_req(argv[i], &ctx) < 0) {
+            printf("Error reading file\n");
+            return 1;
+        }
+    }
+
+    //submit the request and wait for 1 completion
+    int ret =  io_uring_enter(ctx.ring_fd, argc-1, argc-1, IORING_ENTER_GETEVENTS);
+    if(ret < 0){
+        perror("io_uring_enter");
         return 1;
     }
-    read_from_cq(&s);
+    read_from_cq(&ctx);
 
 
     return 0;
