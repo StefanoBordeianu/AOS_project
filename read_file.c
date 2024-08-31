@@ -57,6 +57,7 @@ int io_uring_enter(int ring_fd, unsigned int to_submit,
 }
 
 
+/* Print the buffer to the console one character at the time */
 void print_to_user(char *buf, int len){
     while (len > 0) {
         printf("%c",*buf);
@@ -78,37 +79,42 @@ off_t file_size(int fd){
 }
 
 
-int init_io_uring(struct application_data* s){
+int init_io_uring(struct application_data* ctx){
     struct io_uring_params p;
-    struct sq_ring* sqring = &s->sq_ring;
-    struct cq_ring* cqring = &s->cq_ring;
+    struct sq_ring* sqring = &ctx->sq_ring;
+    struct cq_ring* cqring = &ctx->cq_ring;
     void *mapped_ptr;
     int sqring_sz, cqring_sz;
 
 
     memset(&p, 0, sizeof(p));
-    s->ring_fd = io_uring_setup(QUEUE_DEPTH, &p);
-    if (s->ring_fd < 0) {
+    /*
+     * Call io_uring_setup. It returns a file descriptor that we can use to map the queues
+     * Pass also the io_uring_params struct, it will be filled with the offsets in which 
+     * the different components of io_uring have been allocated
+     */
+    ctx->ring_fd = io_uring_setup(QUEUE_DEPTH, &p);
+    if (ctx->ring_fd < 0) {
         perror("io_uring_setup");
         return 1;
     }
 
     sqring_sz = p.sq_off.array + p.sq_entries * sizeof(unsigned);
-    cqring_sz = p.cq_off.cqes + p.cq_entries * sizeof(struct io_uring_cqe);
 
-
-    if (cqring_sz > sqring_sz) {
-        sqring_sz = cqring_sz;
-    }
-    cqring_sz = sqring_sz;
-
-    //map the rings
-    mapped_ptr = mmap(0, sqring_sz, PROT_READ|PROT_WRITE, MAP_SHARED, s->ring_fd, IORING_OFF_SQ_RING);
+    /*
+     * Here we map the two rings into userspace. The memory has alrealdy been allocated by the kernel
+     * during the io_uring_setup system call, we just need to map it to userspace.
+     */
+    mapped_ptr = mmap(0, sqring_sz, PROT_READ|PROT_WRITE, MAP_SHARED, ctx->ring_fd, IORING_OFF_SQ_RING);
     if (mapped_ptr == MAP_FAILED) {
         perror("mmap");
         return 1;
     }
 
+    /*
+     * proceed and save into our data structures the addresses of the different components 
+     * according to the offsets provided by the kernel
+     */
     sqring->head = mapped_ptr + p.sq_off.head;
     sqring->tail = mapped_ptr + p.sq_off.tail;
     sqring->ring_mask = mapped_ptr + p.sq_off.ring_mask;
@@ -123,8 +129,8 @@ int init_io_uring(struct application_data* s){
     cqring->cqes = mapped_ptr + p.cq_off.cqes;
 
     //map the sqe array
-    s->sqes = mmap(0, p.sq_entries*sizeof(struct io_uring_sqe), PROT_READ|PROT_WRITE, MAP_SHARED, s->ring_fd, IORING_OFF_SQES);
-    if (s->sqes == MAP_FAILED) {
+    ctx->sqes = mmap(0, p.sq_entries*sizeof(struct io_uring_sqe), PROT_READ|PROT_WRITE, MAP_SHARED, ctx->ring_fd, IORING_OFF_SQES);
+    if (ctx->sqes == MAP_FAILED) {
         perror("mmap");
         return 1;
     }
@@ -152,8 +158,10 @@ int submit_read_req(char* filename, struct application_data* ctx){
         return 1;
     off_t bytes_remaining = size;
     blocks = (int) size / BLOCK_DIM;
-    if(size % BLOCK_DIM) blocks++;
+    if(size % BLOCK_DIM) 
+        blocks++;
 
+    /* Allocate memory for the iovec structure to use in the readv request */
     req_info = malloc(sizeof(*req_info) + sizeof(struct iovec) * blocks);
     if(!req_info) {
         printf("Malloc failed\n");
@@ -161,7 +169,7 @@ int submit_read_req(char* filename, struct application_data* ctx){
     }
     req_info->file_size = size;
 
-    //setup the iov for the vectored read
+    /* Fill out the iovec for the readv request */
     while(bytes_remaining){
         off_t bytes_to_read = bytes_remaining;
         if (bytes_to_read > BLOCK_DIM)
@@ -180,14 +188,17 @@ int submit_read_req(char* filename, struct application_data* ctx){
         bytes_remaining -= bytes_to_read;
     }
 
-    //add the SQE at the tail of the ring buffer
+    /* Fill out the request and insert it into the submission ring 
+     * we need to use barriers to be sure that the all the writes are
+     * done before we update the tail
+     */
     tail = *sqring->tail;
     index = tail & *ctx->sq_ring.ring_mask;
     sqe = &ctx->sqes[index];
     sqe->fd = file_fd;
     sqe->opcode = IORING_OP_READV;
     sqe->addr = (unsigned long) req_info->iovecs;
-    sqe->flags = 0;
+    sqe->flags = IOSQE_IO_LINK;
     sqe->len = blocks;
     sqe->off = 0;
     sqe->user_data = (unsigned long long) req_info;
@@ -210,31 +221,41 @@ void read_from_cq(struct application_data *s){
     unsigned head, reaped = 0;
     int blocks;
 
+    /* We use a local variable to keep track of the head, will update the one
+       visible by the kernel at the end of the completion process */
     head = *cqring->head;
 
+    /* Enter the loop and start consuming completion queue events (CQEs)
+     * until the ring is empty */
     while(1){
         barrier();
 
-        //checking if the ring is empty
+        /* If the head and the tail are equal it means that the ring is empty, we can finish */
         if (head == *cqring->tail)
             break;
 
-        //getting the entry
+        /* Grab the next CQE */
         cqe = &cqring->cqes[head & *s->cq_ring.ring_mask];
+
         file_inf = (struct request_info*) cqe->user_data;
+        /* check for errors */
         if (cqe->res < 0){
             printf("error while reading, error number:%d",-cqe->res);
         }
 
         blocks = (int) (file_inf->file_size / BLOCK_DIM);
-        if(file_inf->file_size % BLOCK_DIM) blocks++;
+        if(file_inf->file_size % BLOCK_DIM) 
+            blocks++;
 
+        /* The request is complete so the iovec will contain the contents of the file, print them */
         for(int i=0; i<blocks; i++)
             print_to_user(file_inf->iovecs[i].iov_base, file_inf->iovecs[i].iov_len);
 
         head++;
     }
 
+    /* Make visible to the kernel that we have consumed the CQEs, 
+       reminder that *cqring->head is the field placed in the shared memory */
     *cqring->head = head;
     barrier();
 }
@@ -254,6 +275,7 @@ int main(int argc, char *argv[]){
         return 1;
     }
 
+    /* For each argument passed, fill out a request and put it into the submission ring */
     for(int i=1; i<argc; i++){
         if(submit_read_req(argv[i], &ctx) < 0) {
             printf("Error reading file\n");
@@ -261,12 +283,14 @@ int main(int argc, char *argv[]){
         }
     }
 
-    //submit the request and wait for 1 completion
+    /* Submit the request and wait for everything to be completed */
     int ret =  io_uring_enter(ctx.ring_fd, argc-1, argc-1, IORING_ENTER_GETEVENTS);
     if(ret < 0){
         perror("io_uring_enter");
         return 1;
     }
+
+    /* Read all the completions and print the contents of the read files to  */
     read_from_cq(&ctx);
 
 
